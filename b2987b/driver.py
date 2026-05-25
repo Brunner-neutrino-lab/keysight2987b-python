@@ -39,6 +39,52 @@ SIM_GAIN_K   = 5e-9   # A/V post-breakdown slope (current per overvoltage)
 SIM_NOISE    = 5e-14   # A  current noise floor
 
 
+# ---------------------------------------------------------------------------
+# SCPI helpers (range and aperture composition)
+# ---------------------------------------------------------------------------
+
+def _apply_range(inst, sense: str,
+                 auto: bool, fixed_value: float | None,
+                 lower: float, upper: float) -> None:
+    """Set :SENS1:<sense>:RANG to auto-with-limits or a fixed value.
+
+    `sense` is "CURR" or "VOLT". Limits and fixed are in instrument units
+    (A for CURR, V for VOLT).
+    """
+    if auto:
+        inst.write(f':SENS1:{sense}:RANG:AUTO ON;'
+                   f'AUTO:ULIM {upper:.6e};LLIM {lower:.6e}')
+    else:
+        if fixed_value is None:
+            raise ValueError(f"{sense}: fixed range requested but no value given")
+        inst.write(f':SENS1:{sense}:RANG:AUTO OFF;'
+                   f':SENS1:{sense}:RANG {fixed_value:.6e}')
+
+
+def _apply_aperture(inst, sense: str,
+                    mode: str, fixed_s: float | None) -> None:
+    """Set :SENS1:<sense>:APER auto-mode or fixed seconds.
+
+    mode is one of AUTO|SHORT|MEDIUM|LONG|FIXED (case-insensitive).
+    AUTO|SHORT|MEDIUM|LONG → :APER:AUTO ON with AUTO:MODE accordingly
+    (AUTO maps to LONG, the firmware's documented default).
+    FIXED → :APER:AUTO OFF with explicit seconds.
+    """
+    mode = mode.upper()
+    speed_map = {"AUTO": "LONG", "SHORT": "SHOR", "MEDIUM": "MED", "LONG": "LONG"}
+    if mode in speed_map:
+        inst.write(f':SENS1:{sense}:APER:AUTO ON;'
+                   f'AUTO:MODE {speed_map[mode]}')
+    elif mode == "FIXED":
+        if fixed_s is None:
+            raise ValueError(f"{sense}: FIXED aperture requested but no value given")
+        inst.write(f':SENS1:{sense}:APER:AUTO OFF;'
+                   f':SENS1:{sense}:APER {fixed_s:.6e}')
+    else:
+        raise ValueError(f"{sense}: unknown aperture mode {mode!r}; "
+                         "expected AUTO|SHORT|MEDIUM|LONG|FIXED")
+
+
 class B2987BDriver:
     """
     Low-level SCPI driver for the Keysight B2987B.
@@ -214,9 +260,22 @@ class B2987BDriver:
                               n_points_per_voltage: int = 1,
                               delay_s: float = 0.1,
                               measure_voltage: bool = False,
-                              current_range_auto: bool = True,
-                              current_range_v: float | None = None,
-                              current_aperture_s: float | None = None):
+                              # Current sense
+                              current_range_auto:  bool        = True,
+                              current_range_v:     float | None = None,
+                              current_range_lower_a: float     = 2e-12,
+                              current_range_upper_a: float     = 2e-2,
+                              current_aperture_mode: str       = "AUTO",   # AUTO|SHORT|MEDIUM|LONG|FIXED
+                              current_aperture_s:  float | None = None,
+                              # Voltage sense (only if measure_voltage=True)
+                              voltage_range_auto:  bool        = True,
+                              voltage_range_v:     float | None = None,
+                              voltage_range_lower_v: float     = 2.0,
+                              voltage_range_upper_v: float     = 20.0,
+                              voltage_aperture_mode: str       = "AUTO",   # AUTO|SHORT|MEDIUM|LONG|FIXED
+                              voltage_aperture_s:  float | None = None,
+                              # Zero-reference subtraction (defaults preserve prior behaviour)
+                              zero_reference:      bool        = True):
         """
         Configure a list sweep.
 
@@ -231,11 +290,26 @@ class B2987BDriver:
         measure_voltage : bool
             If True, also measure the sense voltage at each point.
         current_range_auto : bool
-            If True, use auto-range for current. If False, use current_range_v.
+            True → auto-range with [current_range_lower_a, current_range_upper_a].
+            False → fixed at current_range_v.
         current_range_v : float, optional
-            Manual current range in amperes (e.g. 2e-9 for 2 nA range).
+            Fixed current range in A (2e-12 … 2e-2). Used when current_range_auto=False.
+        current_range_lower_a, current_range_upper_a : float
+            Lower/upper bound for current auto-range. Defaults: 2e-12 … 2e-2.
+        current_aperture_mode : str
+            "AUTO"   → auto-aperture (firmware picks default speed, LONG).
+            "SHORT", "MEDIUM", "LONG" → auto-aperture pinned to that speed.
+            "FIXED"  → use current_aperture_s explicitly.
         current_aperture_s : float, optional
-            Integration aperture in seconds. None = auto (LONG mode).
+            Fixed integration aperture in seconds (1e-5 … 2). Used when
+            current_aperture_mode="FIXED".
+        voltage_range_auto, voltage_range_v, voltage_range_lower_v,
+        voltage_range_upper_v, voltage_aperture_mode, voltage_aperture_s :
+            Same shape as the current_* equivalents but for the voltmeter.
+            Only applied if measure_voltage=True. Voltage range is 2 … 20 V.
+        zero_reference : bool
+            If True, acquire and subtract a zero-current reference at the
+            start of the sweep (preserves prior driver behaviour).
         """
         # Build the expanded voltage list (each voltage repeated n times)
         sweep_list = []
@@ -259,28 +333,30 @@ class B2987BDriver:
             # Sense functions
             if measure_voltage:
                 inst.write(':SENS1:FUNC "CURR","VOLT"')
-                inst.write(':SENS1:VOLT:RANG:AUTO ON;AUTO:ULIM 20;LLIM 2')
+                _apply_range(inst, "VOLT",
+                             voltage_range_auto, voltage_range_v,
+                             voltage_range_lower_v, voltage_range_upper_v)
+                _apply_aperture(inst, "VOLT",
+                                voltage_aperture_mode, voltage_aperture_s)
             else:
                 inst.write(':SENS1:FUNC "CURR"')
 
-            # Current range
-            if current_range_auto or current_range_v is None:
-                inst.write(':SENS1:CURR:RANG:AUTO ON;AUTO:ULIM 2E-2;LLIM 2E-12')
-            else:
-                inst.write(f':SENS1:CURR:RANG {current_range_v:.2e}')
-
-            # Current aperture
-            if current_aperture_s is None:
-                inst.write(':SENS1:CURR:APER:AUTO ON;AUTO:MODE LONG')
-            else:
-                inst.write(f':SENS1:CURR:APER {current_aperture_s:.2e}')
+            # Current sense range + aperture
+            _apply_range(inst, "CURR",
+                         current_range_auto, current_range_v,
+                         current_range_lower_a, current_range_upper_a)
+            _apply_aperture(inst, "CURR",
+                            current_aperture_mode, current_aperture_s)
 
             # Trigger: auto internal, with delay, n_total counts
             inst.write(f":TRIG1:ALL:SOUR AINT;DEL {delay_s:.4f};COUN {n_total}")
 
             # Zero reference (offset current subtraction)
-            inst.write(":SENS1:CURR:REF:ACQ")
-            inst.write(":SENS1:CURR:REF:STAT 1")
+            if zero_reference:
+                inst.write(":SENS1:CURR:REF:ACQ")
+                inst.write(":SENS1:CURR:REF:STAT 1")
+            else:
+                inst.write(":SENS1:CURR:REF:STAT 0")
 
     def run_sweep(self, timeout_s: float = 600.0) -> dict:
         """

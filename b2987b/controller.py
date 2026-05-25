@@ -164,7 +164,25 @@ class B2987BController:
         self._measure_voltage = False
         self._delay_s         = 0.1
         self._n_per_voltage   = 5
-        self._current_aperture: float | None = None
+
+        # Current sense
+        self._current_range_auto:    bool        = True
+        self._current_range_v:       float | None = None
+        self._current_range_lower_a: float       = 2e-12
+        self._current_range_upper_a: float       = 2e-2
+        self._current_aperture_mode: str         = "AUTO"   # AUTO|SHORT|MEDIUM|LONG|FIXED
+        self._current_aperture: float | None = None         # used when mode == FIXED
+
+        # Voltage sense (only consulted when measure_voltage=True)
+        self._voltage_range_auto:    bool        = True
+        self._voltage_range_v:       float | None = None
+        self._voltage_range_lower_v: float       = 2.0
+        self._voltage_range_upper_v: float       = 20.0
+        self._voltage_aperture_mode: str         = "AUTO"
+        self._voltage_aperture:      float | None = None
+
+        # Zero-reference subtraction (current offset zeroing at sweep start)
+        self._zero_reference: bool = True
 
         # Bias state tracking
         self._bias_voltage    = 0.0
@@ -196,31 +214,62 @@ class B2987BController:
                         delay_s: float = 0.1,
                         measure_voltage: bool = False,
                         current_limit: bool = False,
-                        current_aperture_s: float | None = None):
+                        # Backwards-compat alias for current_aperture (FIXED mode)
+                        current_aperture_s: float | None = None,
+                        # Current sense
+                        current_range_auto: bool | None = None,
+                        current_range_v: float | None = None,
+                        current_range_lower_a: float | None = None,
+                        current_range_upper_a: float | None = None,
+                        current_aperture_mode: str | None = None,
+                        # Voltage sense
+                        voltage_range_auto: bool | None = None,
+                        voltage_range_v: float | None = None,
+                        voltage_range_lower_v: float | None = None,
+                        voltage_range_upper_v: float | None = None,
+                        voltage_aperture_mode: str | None = None,
+                        voltage_aperture_s: float | None = None,
+                        # Zero-reference
+                        zero_reference: bool | None = None):
         """
-        Set defaults for IV sweeps.
+        Set defaults for IV sweeps. Only-given kwargs update; unspecified
+        kwargs keep their previous values, so this is safe to call repeatedly
+        with partial updates.
 
-        Parameters
-        ----------
-        source_range : float
-            Voltage source range: 20 or 1000 V.
-        n_per_voltage : int
-            Number of current measurements averaged at each voltage step.
-        delay_s : float
-            Trigger delay between voltage steps (s). Longer = more settling.
-        measure_voltage : bool
-            Also measure sense voltage at each step (slower; useful for verification).
-        current_limit : bool
-            Enable the internal current-limiting resistor.
-        current_aperture_s : float, optional
-            Current measurement integration time (s). None = auto (LONG mode).
+        Backwards-compat: passing only `current_aperture_s` (a float) sets
+        the current aperture to FIXED at that value, preserving the older
+        API where `current_aperture_s=None` meant AUTO/LONG.
         """
-        self._source_range      = source_range
-        self._n_per_voltage     = n_per_voltage
-        self._delay_s           = delay_s
-        self._measure_voltage   = measure_voltage
-        self._current_limit     = current_limit
-        self._current_aperture  = current_aperture_s
+        self._source_range    = source_range
+        self._n_per_voltage   = n_per_voltage
+        self._delay_s         = delay_s
+        self._measure_voltage = measure_voltage
+        self._current_limit   = current_limit
+
+        # Current sense — partial updates
+        if current_range_auto    is not None: self._current_range_auto    = current_range_auto
+        if current_range_v       is not None: self._current_range_v       = current_range_v
+        if current_range_lower_a is not None: self._current_range_lower_a = current_range_lower_a
+        if current_range_upper_a is not None: self._current_range_upper_a = current_range_upper_a
+        if current_aperture_mode is not None: self._current_aperture_mode = current_aperture_mode
+
+        # Backwards-compat: current_aperture_s=<float> → FIXED at that value.
+        # current_aperture_s=None and no current_aperture_mode set → keep prior.
+        if current_aperture_s is not None and current_aperture_mode is None:
+            self._current_aperture_mode = "FIXED"
+            self._current_aperture      = current_aperture_s
+        elif current_aperture_s is not None:
+            self._current_aperture      = current_aperture_s
+
+        # Voltage sense — partial updates
+        if voltage_range_auto    is not None: self._voltage_range_auto    = voltage_range_auto
+        if voltage_range_v       is not None: self._voltage_range_v       = voltage_range_v
+        if voltage_range_lower_v is not None: self._voltage_range_lower_v = voltage_range_lower_v
+        if voltage_range_upper_v is not None: self._voltage_range_upper_v = voltage_range_upper_v
+        if voltage_aperture_mode is not None: self._voltage_aperture_mode = voltage_aperture_mode
+        if voltage_aperture_s    is not None: self._voltage_aperture      = voltage_aperture_s
+
+        if zero_reference        is not None: self._zero_reference        = zero_reference
 
         self._driver.set_source_range(source_range)
         self._driver.set_current_limit(current_limit)
@@ -362,12 +411,25 @@ class B2987BController:
         self._driver.set_current_limit(self._current_limit)
 
         self._driver.configure_list_sweep(
-            voltages            = voltages,
-            n_points_per_voltage = n_per,
-            delay_s             = delay,
-            measure_voltage     = meas_v,
-            current_range_auto  = True,
-            current_aperture_s  = self._current_aperture,
+            voltages              = voltages,
+            n_points_per_voltage  = n_per,
+            delay_s               = delay,
+            measure_voltage       = meas_v,
+            # Current sense — all from controller state
+            current_range_auto    = self._current_range_auto,
+            current_range_v       = self._current_range_v,
+            current_range_lower_a = self._current_range_lower_a,
+            current_range_upper_a = self._current_range_upper_a,
+            current_aperture_mode = self._current_aperture_mode,
+            current_aperture_s    = self._current_aperture,
+            # Voltage sense
+            voltage_range_auto    = self._voltage_range_auto,
+            voltage_range_v       = self._voltage_range_v,
+            voltage_range_lower_v = self._voltage_range_lower_v,
+            voltage_range_upper_v = self._voltage_range_upper_v,
+            voltage_aperture_mode = self._voltage_aperture_mode,
+            voltage_aperture_s    = self._voltage_aperture,
+            zero_reference        = self._zero_reference,
         )
 
         run_ts = time.time()
