@@ -352,6 +352,15 @@ class B2987BController:
         delay          = delay_s         if delay_s         is not None else self._delay_s
         meas_v         = measure_voltage if measure_voltage is not None else self._measure_voltage
 
+        # The B2987's source range defaults to 20 V after *RST.  If sweep()
+        # is called without a prior set_bias() (which would have set the
+        # range), any voltage above the small-range limit returns
+        # -222 "Data out of range" at INIT and FETCH returns 9.91e+37
+        # (the "no data" sentinel).  Push the configured range every time
+        # so sweeps work standalone.
+        self._driver.set_source_range(self._source_range)
+        self._driver.set_current_limit(self._current_limit)
+
         self._driver.configure_list_sweep(
             voltages            = voltages,
             n_points_per_voltage = n_per,

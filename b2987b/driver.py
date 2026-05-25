@@ -333,7 +333,16 @@ class B2987BDriver:
                 f"Could not open VISA resource {self._visa_str!r} after 3 attempts."
             )
 
-        self._inst.clear()
+        # device_clear() is supposed to abort pending operations from a prior
+        # session, but the B2987's VXI-11 service occasionally hangs on the
+        # clear RPC when the previous session didn't shut down cleanly. The
+        # *RST that follows accomplishes the same software reset, so a
+        # failed clear is non-fatal — log and continue.
+        try:
+            self._inst.timeout = 2000
+            self._inst.clear()
+        except Exception:
+            pass
         self._inst.timeout = TIMEOUT_MS
 
         idn = self._inst.query("*IDN?")
