@@ -265,22 +265,89 @@ def build_page(get_controller: Optional[Callable[[], Optional[B2987BController]]
 
         # ----------- IV sweep tab ------------
         with ui.tab_panel(t_sweep):
+            # Row 1 — voltage list + run controls
             with ui.row().classes("w-full gap-3 items-start"):
                 with ui.card().classes("b2987-card"):
-                    ui.html("<h2>voltage range</h2>")
-                    sw_start = ui.number(label="start (V)", value=40.0, step=0.1).classes("w-32 num")
-                    sw_stop  = ui.number(label="stop (V)",  value=55.0, step=0.1).classes("w-32 num")
-                    sw_step  = ui.number(label="step (V)",  value=0.05, step=0.01).classes("w-32 num")
+                    ui.html("<h2>voltage list</h2>")
+                    sw_start = ui.number(label="start (V)", value=40.0, step=0.1).classes("w-28 num")
+                    sw_stop  = ui.number(label="stop (V)",  value=55.0, step=0.1).classes("w-28 num")
+                    sw_step  = ui.number(label="step (V)",  value=0.05, step=0.01).classes("w-28 num")
+                    sw_npts  = ui.number(label="pts / V",    value=5,    step=1).classes("w-28 num")
+                    sw_delay = ui.number(label="delay (s)",  value=0.1,  step=0.05).classes("w-28 num")
 
                 with ui.card().classes("b2987-card"):
-                    ui.html("<h2>sweep parameters</h2>")
-                    sw_npts  = ui.number(label="pts / V",     value=5,    step=1).classes("w-32 num")
-                    sw_delay = ui.number(label="delay (s)",   value=0.1,  step=0.05).classes("w-32 num")
+                    ui.html("<h2>source</h2>")
+                    sw_source_range = ui.select(["20", "1000"], value="1000",
+                                                label="range (V)").classes("w-32")
+                    sw_resistor = ui.switch("current-limiting resistor", value=False)
+
+                with ui.card().classes("b2987-card"):
+                    ui.html("<h2>current sense</h2>")
+                    with ui.row().classes("items-center gap-2"):
+                        sw_curr_range_mode = ui.select(["auto", "fixed"], value="auto",
+                                                       label="range").classes("w-28")
+                        sw_curr_range_fixed = ui.number(label="fixed (A)", value=2e-9,
+                                                        format="%.2e").classes("w-32 num")
+                        sw_curr_range_lower = ui.number(label="auto lo (A)", value=2e-12,
+                                                        format="%.2e").classes("w-32 num")
+                        sw_curr_range_upper = ui.number(label="auto hi (A)", value=2e-2,
+                                                        format="%.2e").classes("w-32 num")
+                    with ui.row().classes("items-center gap-2"):
+                        sw_curr_aper_mode = ui.select(
+                            ["AUTO", "SHORT", "MEDIUM", "LONG", "FIXED"], value="AUTO",
+                            label="aperture").classes("w-32")
+                        sw_curr_aper_s = ui.number(label="fixed (s)", value=0.02,
+                                                   step=0.001, format="%.4f").classes("w-32 num")
+                    # Reactive visibility: fixed value only when mode == fixed/FIXED
+                    sw_curr_range_fixed.bind_visibility_from(sw_curr_range_mode, "value",
+                                                              lambda v: v == "fixed")
+                    sw_curr_range_lower.bind_visibility_from(sw_curr_range_mode, "value",
+                                                              lambda v: v == "auto")
+                    sw_curr_range_upper.bind_visibility_from(sw_curr_range_mode, "value",
+                                                              lambda v: v == "auto")
+                    sw_curr_aper_s.bind_visibility_from(sw_curr_aper_mode, "value",
+                                                         lambda v: v == "FIXED")
+
+            # Row 2 — voltage sense + run
+            with ui.row().classes("w-full gap-3 items-start"):
+                with ui.card().classes("b2987-card"):
+                    ui.html("<h2>voltage sense</h2>")
                     sw_measv = ui.switch("measure sense V", value=False)
-                    sw_logy  = ui.switch("log Y", value=True)
+                    with ui.row().classes("items-center gap-2"):
+                        sw_volt_range_mode = ui.select(["auto", "fixed"], value="auto",
+                                                       label="range").classes("w-28")
+                        sw_volt_range_fixed = ui.number(label="fixed (V)", value=20.0,
+                                                        step=0.5).classes("w-28 num")
+                        sw_volt_range_lower = ui.number(label="auto lo (V)", value=2.0,
+                                                        step=0.5).classes("w-32 num")
+                        sw_volt_range_upper = ui.number(label="auto hi (V)", value=20.0,
+                                                        step=0.5).classes("w-32 num")
+                    with ui.row().classes("items-center gap-2"):
+                        sw_volt_aper_mode = ui.select(
+                            ["AUTO", "SHORT", "MEDIUM", "LONG", "FIXED"], value="AUTO",
+                            label="aperture").classes("w-32")
+                        sw_volt_aper_s = ui.number(label="fixed (s)", value=0.02,
+                                                   step=0.001, format="%.4f").classes("w-32 num")
+                    sw_volt_range_fixed.bind_visibility_from(sw_volt_range_mode, "value",
+                                                              lambda v: v == "fixed")
+                    sw_volt_range_lower.bind_visibility_from(sw_volt_range_mode, "value",
+                                                              lambda v: v == "auto")
+                    sw_volt_range_upper.bind_visibility_from(sw_volt_range_mode, "value",
+                                                              lambda v: v == "auto")
+                    sw_volt_aper_s.bind_visibility_from(sw_volt_aper_mode, "value",
+                                                         lambda v: v == "FIXED")
+                    # Hide the whole voltage-sense detail row when the switch is off
+                    sw_volt_range_mode.bind_visibility_from(sw_measv, "value")
+                    sw_volt_aper_mode.bind_visibility_from(sw_measv, "value")
+                    sw_volt_range_fixed.bind_visibility_from(sw_measv, "value")
+                    sw_volt_range_lower.bind_visibility_from(sw_measv, "value")
+                    sw_volt_range_upper.bind_visibility_from(sw_measv, "value")
+                    sw_volt_aper_s.bind_visibility_from(sw_measv, "value")
 
                 with ui.card().classes("b2987-card"):
-                    ui.html("<h2>run</h2>")
+                    ui.html("<h2>run + plot</h2>")
+                    sw_zero_ref = ui.switch("zero-reference current at start", value=True)
+                    sw_logy     = ui.switch("log Y on plot", value=True)
                     sw_progress = ui.label("ready").classes("num text-sm")
 
                     async def run_sweep():
@@ -291,24 +358,65 @@ def build_page(get_controller: Optional[Callable[[], Optional[B2987BController]]
                         if step <= 0:
                             log_msg("step must be > 0"); return
                         voltages = np.arange(start, stop + step * 0.5, step).tolist()
-                        sw_progress.text = f"running ({len(voltages)} pts)…"
-                        log_msg(f"sweep {start} → {stop} V, step={step} V, {len(voltages)} pts")
                         try:
-                            result: SweepResult = await in_thread(
-                                c.sweep, voltages,
-                                int(sw_npts.value), float(sw_delay.value),
-                                bool(sw_measv.value),
+                            # Push all rich measurement params via configure_sweep
+                            c.configure_sweep(
+                                source_range          = float(sw_source_range.value),
+                                n_per_voltage         = int(sw_npts.value),
+                                delay_s               = float(sw_delay.value),
+                                measure_voltage       = bool(sw_measv.value),
+                                current_limit         = bool(sw_resistor.value),
+                                current_range_auto    = (sw_curr_range_mode.value == "auto"),
+                                current_range_v       = float(sw_curr_range_fixed.value),
+                                current_range_lower_a = float(sw_curr_range_lower.value),
+                                current_range_upper_a = float(sw_curr_range_upper.value),
+                                current_aperture_mode = str(sw_curr_aper_mode.value),
+                                current_aperture_s    = float(sw_curr_aper_s.value),
+                                voltage_range_auto    = (sw_volt_range_mode.value == "auto"),
+                                voltage_range_v       = float(sw_volt_range_fixed.value),
+                                voltage_range_lower_v = float(sw_volt_range_lower.value),
+                                voltage_range_upper_v = float(sw_volt_range_upper.value),
+                                voltage_aperture_mode = str(sw_volt_aper_mode.value),
+                                voltage_aperture_s    = float(sw_volt_aper_s.value),
+                                zero_reference        = bool(sw_zero_ref.value),
                             )
+                            sw_progress.text = f"running ({len(voltages)} V × {int(sw_npts.value)} pts)…"
+                            log_msg(f"sweep {start}→{stop} V step={step} V, {len(voltages)} pts")
+                            result: SweepResult = await in_thread(c.sweep, voltages)
                             _own["last_sweep"] = result
                             n = len(result.avg_source_v)
-                            sw_progress.text = f"done — {n} pts, I_max={float(np.abs(result.avg_current_a).max()):.3e} A"
+                            sw_progress.text = (f"done — {n} V steps, "
+                                                f"|I|_max={float(np.abs(result.avg_current_a).max()):.3e} A")
                             log_msg(sw_progress.text)
                             refresh_plot()
                         except Exception as e:
                             sw_progress.text = "FAIL"
                             log_msg(f"sweep FAIL: {type(e).__name__}: {e}")
 
-                    ui.button("run sweep", on_click=run_sweep).props("color=primary")
+                    def save_csv():
+                        r = _own["last_sweep"]
+                        if r is None:
+                            log_msg("no sweep result yet"); return
+                        import csv, os, time as _t
+                        fname = f"sweep_{_t.strftime('%Y%m%d_%H%M%S')}.csv"
+                        path = os.path.join(os.getcwd(), fname)
+                        with open(path, "w", newline="") as f:
+                            w = csv.writer(f)
+                            w.writerow(["source_v", "current_a", "err_current_a",
+                                        "voltage_v", "err_voltage_v"])
+                            for i in range(len(r.avg_source_v)):
+                                w.writerow([
+                                    float(r.avg_source_v[i]),
+                                    float(r.avg_current_a[i]),
+                                    float(r.err_current_a[i]) if r.err_current_a is not None else "",
+                                    float(r.avg_voltage_v[i]) if r.avg_voltage_v is not None else "",
+                                    float(r.err_voltage_v[i]) if r.err_voltage_v is not None else "",
+                                ])
+                        log_msg(f"saved {path}")
+
+                    with ui.row().classes("gap-2"):
+                        ui.button("run sweep", on_click=run_sweep).props("color=primary")
+                        ui.button("save CSV",  on_click=save_csv)
 
             # Plot below the controls
             plot = ui.matplotlib(figsize=(8, 3.2)).classes("w-full")
