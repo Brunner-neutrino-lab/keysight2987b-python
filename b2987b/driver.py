@@ -70,6 +70,7 @@ class B2987BDriver:
         self._sim_i_dark  = SIM_I_DARK
         self._sim_alpha   = SIM_ALPHA
         self._sim_gain_k  = SIM_GAIN_K
+        self._sim_noise   = SIM_NOISE
         self._sim_rng     = np.random.default_rng()
 
     # ------------------------------------------------------------------
