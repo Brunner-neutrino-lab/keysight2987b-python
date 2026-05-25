@@ -1,6 +1,6 @@
 numpy
 scipy
 matplotlib
-PyQt5
+nicegui
 pyvisa
 pyvisa-py
