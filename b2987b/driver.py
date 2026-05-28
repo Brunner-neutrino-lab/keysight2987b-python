@@ -409,16 +409,27 @@ class B2987BDriver:
                 f"Could not open VISA resource {self._visa_str!r} after 3 attempts."
             )
 
+        # Raw SOCKET sessions (TCPIP::host::5025::SOCKET) are stateless on the
+        # instrument side — no VXI-11 RPC link table to leak — and need
+        # explicit terminations.  Default pyvisa values differ between
+        # transport types; setting both is safe and avoids hangs on read.
+        is_socket = "SOCKET" in self._visa_str.upper()
+        if is_socket:
+            self._inst.read_termination  = "\n"
+            self._inst.write_termination = "\n"
+
         # device_clear() is supposed to abort pending operations from a prior
         # session, but the B2987's VXI-11 service occasionally hangs on the
         # clear RPC when the previous session didn't shut down cleanly. The
         # *RST that follows accomplishes the same software reset, so a
-        # failed clear is non-fatal — log and continue.
-        try:
-            self._inst.timeout = 2000
-            self._inst.clear()
-        except Exception:
-            pass
+        # failed clear is non-fatal — log and continue.  SOCKET sessions
+        # don't expose device_clear, so we just skip it.
+        if not is_socket:
+            try:
+                self._inst.timeout = 2000
+                self._inst.clear()
+            except Exception:
+                pass
         self._inst.timeout = TIMEOUT_MS
 
         idn = self._inst.query("*IDN?")
@@ -440,11 +451,21 @@ class B2987BDriver:
 
     def _disconnect_hardware(self):
         if self._inst is not None:
+            is_socket = "SOCKET" in (self._visa_str or "").upper()
             try:
                 self.abort()
                 self.ammeter_off()
                 self.output_off()
-                self._inst.clear()
+            except Exception:
+                pass
+            # device_clear is a VXI-11/USB IEEE-488 operation; SOCKET
+            # sessions don't implement it and pyvisa raises.  Skip it there.
+            if not is_socket:
+                try:
+                    self._inst.clear()
+                except Exception:
+                    pass
+            try:
                 self._inst.close()
             except Exception:
                 pass
