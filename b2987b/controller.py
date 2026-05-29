@@ -306,6 +306,31 @@ class B2987BController:
         self._driver.output_off()
         self._bias_active = False
 
+    # ------------------------------------------------------------------
+    # High-voltage interlock (delegates to the driver, the single sink all
+    # voltage commands pass through)
+    # ------------------------------------------------------------------
+
+    @property
+    def hv_threshold(self) -> float:
+        return self._driver.hv_threshold
+
+    @hv_threshold.setter
+    def hv_threshold(self, value: float):
+        self._driver.hv_threshold = value
+
+    def set_hv_confirm(self, callback):
+        """Register the confirmer invoked when a command exceeds hv_threshold.
+
+        callback(vmax: float) -> bool. None restores deny-by-default.
+        """
+        self._driver.set_hv_confirm(callback)
+
+    @property
+    def hv_confirm(self):
+        """The currently-registered confirmer, or None (deny-by-default)."""
+        return self._driver.hv_confirm
+
     def ramp_bias(self, target_v: float, step_v: float = 1.0, step_delay_s: float = 0.1):
         """
         Ramp from current bias to target_v in steps.

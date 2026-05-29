@@ -29,6 +29,23 @@ IDN_EXPECTED    = "Keysight Technologies,B2987"
 VMAX_20V   =   20.0    # V (20 V range)
 VMAX_1000V = 1000.0    # V (1000 V range)
 
+# High-voltage interlock: any commanded |V| above this needs explicit
+# confirmation. 60 V sits above routine SiPM operation (V_BD ~52 V plus a
+# few volts of overvoltage) so normal sweeps never trip it.
+HV_DEFAULT_THRESHOLD = 60.0   # V
+
+
+class HighVoltageInterlock(RuntimeError):
+    """Raised when a high-voltage command is not confirmed by the operator."""
+
+    def __init__(self, voltage: float, threshold: float):
+        self.voltage   = voltage
+        self.threshold = threshold
+        super().__init__(
+            f"high-voltage interlock: |{voltage:.3f} V| exceeds the "
+            f"{threshold:.1f} V limit and was not confirmed"
+        )
+
 # Simulation: simple SiPM dark IV model
 # I(V) = I_dark * exp(alpha*(V - VBD)) for V < VBD  (leakage)
 #       = I_dark * (1 + gain*(V-VBD))  for V >= VBD (avalanche)
@@ -111,6 +128,12 @@ class B2987BDriver:
         self._output_on       = False
         self._ammeter_on      = False
 
+        # High-voltage interlock. _hv_confirm is a callable(vmax: float) -> bool
+        # supplied by the GUI / CLI; None means deny-by-default so no
+        # unattended path can push high voltage without an explicit confirmer.
+        self._hv_threshold = HV_DEFAULT_THRESHOLD
+        self._hv_confirm   = None
+
         # Simulation tuning
         self._sim_vbd     = SIM_VBD
         self._sim_i_dark  = SIM_I_DARK
@@ -146,6 +169,53 @@ class B2987BDriver:
         return self._mode
 
     # ------------------------------------------------------------------
+    # High-voltage interlock
+    # ------------------------------------------------------------------
+
+    @property
+    def hv_threshold(self) -> float:
+        """Confirmation threshold in volts; |V| above this needs approval."""
+        return self._hv_threshold
+
+    @hv_threshold.setter
+    def hv_threshold(self, value: float):
+        value = float(value)
+        if value <= 0:
+            raise ValueError(f"hv_threshold must be positive, got {value}")
+        self._hv_threshold = value
+
+    def set_hv_confirm(self, callback):
+        """Register the confirmer used when a command exceeds hv_threshold.
+
+        callback(vmax: float) -> bool — return True to allow. None restores
+        the deny-by-default behaviour.
+        """
+        self._hv_confirm = callback
+
+    @property
+    def hv_confirm(self):
+        """The currently-registered confirmer, or None (deny-by-default)."""
+        return self._hv_confirm
+
+    def _guard_hv(self, voltages):
+        """Enforce the interlock for one voltage or an iterable of them.
+
+        Only meaningful in hardware mode — simulation never energizes
+        anything, so it stays out of the way of tests and dry runs.
+        """
+        if self._mode != "hardware":
+            return
+        if isinstance(voltages, (int, float)):
+            vmax = abs(float(voltages))
+        else:
+            vmax = max((abs(float(v)) for v in voltages), default=0.0)
+        if vmax <= self._hv_threshold:
+            return
+        if self._hv_confirm is not None and self._hv_confirm(vmax):
+            return
+        raise HighVoltageInterlock(vmax, self._hv_threshold)
+
+    # ------------------------------------------------------------------
     # Source control
     # ------------------------------------------------------------------
 
@@ -158,6 +228,7 @@ class B2987BDriver:
         voltage : float
             Target voltage in volts. Sign determines polarity.
         """
+        self._guard_hv(voltage)
         self._source_voltage = voltage
         if self._mode == "hardware":
             self._inst.write(f":SOUR1:VOLT:MODE FIX")
@@ -311,6 +382,8 @@ class B2987BDriver:
             If True, acquire and subtract a zero-current reference at the
             start of the sweep (preserves prior driver behaviour).
         """
+        self._guard_hv(voltages)
+
         # Build the expanded voltage list (each voltage repeated n times)
         sweep_list = []
         for v in voltages:
