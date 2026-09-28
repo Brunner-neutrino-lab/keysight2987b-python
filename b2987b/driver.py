@@ -13,6 +13,9 @@ SCPI commands verified against the existing B2987b-Control-Program/Python_Contro
 electrometer.py implementation.
 """
 
+import json
+import os
+import threading
 import time
 import math
 import numpy as np
@@ -33,6 +36,70 @@ VMAX_1000V = 1000.0    # V (1000 V range)
 # confirmation. 60 V sits above routine SiPM operation (V_BD ~52 V plus a
 # few volts of overvoltage) so normal sweeps never trip it.
 HV_DEFAULT_THRESHOLD = 60.0   # V
+
+
+# Hard bias limit for every process on this machine that drives a B2987
+# through this package (web app, bench scripts, ad-hoc scripts). Persisted, and
+# re-read before every command that sets or enables a voltage, so a change
+# applies to all of them at once. Unlike the HV interlock it cannot be
+# confirmed past.
+BIAS_LOCK_FILE = os.environ.get(
+    "B2987_BIAS_LOCK_FILE", os.path.expanduser("~/.config/b2987b/bias_lock.json"))
+
+
+class BiasLockExceeded(RuntimeError):
+    """A voltage above the persisted bias lock was requested; nothing was sent."""
+
+
+def read_bias_lock() -> dict | None:
+    """{"max_v", "set_at", "set_by"} or None if no lock has been set.
+
+    A lock file that exists but can't be parsed fails closed (0 V), so a
+    damaged file blocks bias instead of silently removing the limit.
+    """
+    try:
+        with open(BIAS_LOCK_FILE) as f:
+            lock = json.load(f)
+        lock["max_v"] = float(lock["max_v"])
+        return lock
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        return {"max_v": 0.0, "set_at": None, "set_by": "",
+                "error": f"bias lock file {BIAS_LOCK_FILE} is unreadable ({e})"}
+
+
+def write_bias_lock(max_v: float, set_by: str = "") -> None:
+    if not max_v >= 0:
+        raise ValueError(f"bias lock must be >= 0 V, got {max_v}")
+    os.makedirs(os.path.dirname(BIAS_LOCK_FILE), exist_ok=True)
+    tmp = BIAS_LOCK_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({"max_v": float(max_v), "set_at": time.time(), "set_by": set_by}, f)
+    os.replace(tmp, BIAS_LOCK_FILE)
+
+
+def check_bias_lock(voltages) -> None:
+    """Raise BiasLockExceeded if any |V| in `voltages` is above the lock."""
+    lock = read_bias_lock()
+    if lock is None:
+        return
+    vals = [voltages] if isinstance(voltages, (int, float)) else list(voltages)
+    vmax = max((abs(float(v)) for v in vals), default=0.0)
+    if vmax > lock["max_v"] + 1e-9:
+        if lock.get("error"):
+            raise BiasLockExceeded(f"{lock['error']}; refusing all bias")
+        raise BiasLockExceeded(
+            f"{vmax:.2f} V is above the {lock['max_v']:.2f} V bias lock")
+
+
+# :STAT:OPER:COND? bits that are set when the transient (bit 1) and acquire
+# (bit 4) systems are idle.
+_ACQ_IDLE_BITS = 0x12
+
+
+class AcquisitionStopped(RuntimeError):
+    """A sweep or ammeter series was stopped by request_stop()."""
 
 
 class HighVoltageInterlock(RuntimeError):
@@ -125,6 +192,8 @@ class B2987BDriver:
 
         # Current instrument state
         self._source_voltage  = 0.0     # V — last commanded voltage
+        self._stop_requested  = threading.Event()
+        self.last_warnings: list[str] = []   # non-fatal errors from the last acquisition
         self._output_on       = False
         self._ammeter_on      = False
 
@@ -205,6 +274,7 @@ class B2987BDriver:
         """
         if self._mode != "hardware":
             return
+        check_bias_lock(voltages)
         if isinstance(voltages, (int, float)):
             vmax = abs(float(voltages))
         else:
@@ -256,9 +326,12 @@ class B2987BDriver:
 
     def output_on(self):
         """Enable the voltage source output."""
-        self._output_on = True
         if self._mode == "hardware":
+            # The level switched on is whatever the instrument holds, which
+            # may have been set by another process or the front panel.
+            check_bias_lock(float(self._inst.query(":SOUR1:VOLT?")))
             self._inst.write(":OUTP1 ON")
+        self._output_on = True
 
     def output_off(self):
         """Disable the voltage source output."""
@@ -292,9 +365,12 @@ class B2987BDriver:
             Current in amperes.
         """
         if self._mode == "hardware":
+            # Acquire (measure) trigger only: INIT:ALL also starts the source's
+            # transient action, and with the source output off the B2987 then
+            # returns 9.91e+37 ("no data"). The ammeter doesn't need the source.
             self._inst.write(":SENS1:FUNC 'CURR'")
-            self._inst.write(":TRIG1:ALL:SOUR AINT;COUN 1")
-            self._inst.write(":INIT:ALL (@1)")
+            self._inst.write(":TRIG1:ACQ:SOUR AINT;COUN 1")
+            self._inst.write(":INIT:ACQ (@1)")
             self._inst.query("*OPC?")
             self._inst.write(":FETC:ARR:CURR? (@1)")
             raw = self._inst.read_ascii_values()
@@ -313,14 +389,75 @@ class B2987BDriver:
         """
         if self._mode == "hardware":
             self._inst.write(":SENS1:FUNC 'CURR','VOLT'")
-            self._inst.write(":TRIG1:ALL:SOUR AINT;COUN 1")
-            self._inst.write(":INIT:ALL (@1)")
+            self._inst.write(":TRIG1:ACQ:SOUR AINT;COUN 1")
+            self._inst.write(":INIT:ACQ (@1)")
             self._inst.query("*OPC?")
             self._inst.write(":FETC:ARR:VOLT? (@1)")
             raw = self._inst.read_ascii_values()
             return float(raw[0])
         else:
             return self._source_voltage
+
+    def configure_current_sense(self, zero_reference: bool = False,
+                                current_range_auto: bool = True,
+                                current_range_v: float | None = None,
+                                current_range_lower_a: float = 2e-12,
+                                current_range_upper_a: float = 2e-2,
+                                current_aperture_mode: str = "AUTO",
+                                current_aperture_s: float | None = None) -> None:
+        """Current function, range and aperture for acquire_current().
+        zero_reference=False makes readings absolute, turning off any
+        subtraction a list sweep left enabled."""
+        if self._mode != "hardware":
+            return
+        inst = self._inst
+        inst.write(':SENS1:FUNC "CURR"')
+        _apply_range(inst, "CURR", current_range_auto, current_range_v,
+                     current_range_lower_a, current_range_upper_a)
+        _apply_aperture(inst, "CURR", current_aperture_mode, current_aperture_s)
+        if zero_reference:
+            inst.write(":SENS1:CURR:REF:ACQ")
+            inst.write(":SENS1:CURR:REF:STAT 1")
+        else:
+            inst.write(":SENS1:CURR:REF:STAT 0")
+
+    def acquire_current(self, n: int, interval_s: float = 0.0, delay_s: float = 0.0,
+                        timeout_s: float = 600.0) -> dict:
+        """n ammeter readings with the configured sense settings, without
+        touching the source. interval_s > 0 paces them on the acquire timer,
+        0 takes them back to back; delay_s precedes each reading. The ammeter
+        input must be on.
+
+        Returns {"current_a": [...], "timestamp_s": [...]} (UTC seconds).
+        """
+        if self._mode != "hardware":
+            v = self._source_voltage if self._output_on else 0.0
+            step = max(interval_s, delay_s + 0.02)
+            t0 = time.time()
+            time.sleep(n * step)
+            return {"current_a": [self._sim_current(v) for _ in range(n)],
+                    "timestamp_s": [t0 + k * step for k in range(n)]}
+        inst = self._inst
+        if interval_s > 0:
+            inst.write(f":TRIG1:ACQ:SOUR TIM;TIM {interval_s:.6f};COUN {n};DEL {delay_s:.6f}")
+        else:
+            inst.write(f":TRIG1:ACQ:SOUR AINT;COUN {n};DEL {delay_s:.6f}")
+        start_utc = time.time()
+        self._wait_acquisition(":INIT:ACQ (@1)", timeout_s)
+        inst.write(":FETC:ARR:CURR? (@1)")
+        current = inst.read_ascii_values()
+        inst.write(":FETC:ARR:TIME? (@1)")
+        rel_time = inst.read_ascii_values()
+        return {"current_a":   list(current),
+                "timestamp_s": [start_utc + t for t in rel_time]}
+
+    def write_level(self, voltage: float) -> None:
+        """Set the output level for a stepped sweep whose voltages were all
+        passed through _guard_hv() beforehand (lock and HV interlock), so the
+        interlock isn't consulted again at every step."""
+        self._source_voltage = voltage
+        if self._mode == "hardware":
+            self._inst.write(f":SOUR1:VOLT {voltage:.6f}")
 
     # ------------------------------------------------------------------
     # List sweep
@@ -443,10 +580,69 @@ class B2987BDriver:
             "voltage_v"  : list[float]  measured voltage (V) or NaN if not measured
             "timestamp_s": list[float]  UTC time at each point (s)
         """
+        self.reset_stop()
         if self._mode == "hardware":
             return self._run_sweep_hardware(timeout_s)
         else:
             return self._run_sweep_simulation()
+
+    def reset_stop(self):
+        """Forget any earlier stop request; call at the start of a run."""
+        self._stop_requested.clear()
+
+    def check_stop(self):
+        if self._stop_requested.is_set():
+            raise AcquisitionStopped("acquisition stopped")
+
+    def request_stop(self):
+        """Ask a running sweep or ammeter series to stop. Thread-safe: the
+        waiting thread sends the abort, so two threads never share the
+        session mid-command."""
+        self._stop_requested.set()
+
+    def _wait_acquisition(self, init_cmd: str, timeout_s: float) -> None:
+        """Start an acquisition and wait for it to finish.
+
+        Polls :STAT:OPER:COND?, which the B2987 answers mid-acquisition: 1152
+        while the transient and acquire systems run, 1170 when both are idle
+        (bits 1 and 4). *OPC + *ESR? can't be used: after *OPC this instrument
+        holds every later query until the acquisition ends, which defeats
+        request_stop(). Errors the instrument queued are checked at the end.
+        """
+        inst = self._inst
+        self.last_warnings = []
+        stale = self._drain_errors()          # not from this acquisition
+        if stale:
+            self.last_warnings.append("earlier: " + "; ".join(stale))
+        inst.write(init_cmd)
+        deadline = time.monotonic() + timeout_s
+        while True:
+            cond = int(float(inst.query(":STAT:OPER:COND?")))
+            if cond & _ACQ_IDLE_BITS == _ACQ_IDLE_BITS:
+                break
+            if self._stop_requested.is_set():
+                self.abort()
+                raise AcquisitionStopped("acquisition stopped")
+            if time.monotonic() > deadline:
+                self.abort()
+                raise TimeoutError(f"acquisition did not finish within {timeout_s:.0f} s")
+            time.sleep(0.02)
+        errors = self._drain_errors()
+        # +231: the zero-reference acquisition failed, so readings are not
+        # offset-corrected -- worth reporting, but the data are still valid.
+        fatal = [e for e in errors if not e.startswith("+231")]
+        if fatal:
+            raise RuntimeError("B2987 reported: " + "; ".join(errors))
+        self.last_warnings += errors
+
+    def _drain_errors(self) -> list[str]:
+        errors = []
+        for _ in range(10):
+            e = self._inst.query(":SYST:ERR?").strip()
+            if e.startswith("+0") or e.startswith("0,"):
+                break
+            errors.append(e)
+        return errors
 
     def abort(self):
         """Abort any ongoing acquisition."""
@@ -553,46 +749,35 @@ class B2987BDriver:
         n_total   = self._sweep_n_total
         meas_volt = self._sweep_measure_voltage
 
+        # In LIST mode OUTP ON applies the immediate level (e.g. a 50 V bias
+        # set earlier) until the first trigger, so start at the first point.
+        inst.write(f":SOUR1:VOLT {self._sweep_list[0]:.6f}")
+        self._source_voltage = self._sweep_list[0]
         self.output_on()
         self.ammeter_on()
-        time.sleep(0.5)
+        try:
+            time.sleep(0.5)
+            start_utc = time.time()
+            self._wait_acquisition(":INIT:ALL (@1)", timeout_s)
 
-        inst.write(":INIT:ALL (@1)")
-        start_utc = time.time()
+            inst.write(":FETC:ARR:SOUR? (@1)")
+            source = inst.read_ascii_values()
 
-        # Wait for acquisition
-        deadline = time.monotonic() + timeout_s
-        while time.monotonic() < deadline:
-            inst.write(":STAT:OPER:COND?")
-            resp = inst.read()
-            if len(resp) >= 3 and resp[2] == "7":
-                break
-            time.sleep(0.1)
-        else:
-            self.abort()
+            inst.write(":FETC:ARR:CURR? (@1)")
+            current = inst.read_ascii_values()
+
+            if meas_volt:
+                inst.write(":FETC:ARR:VOLT? (@1)")
+                voltage = inst.read_ascii_values()
+            else:
+                voltage = [float("nan")] * n_total
+
+            inst.write(":FETC:ARR:TIME? (@1)")
+            rel_time = inst.read_ascii_values()
+            utc_time = [start_utc + t for t in rel_time]
+        finally:
             self.ammeter_off()
             self.output_off()
-            raise TimeoutError(f"Sweep did not complete within {timeout_s:.0f}s")
-
-        # Fetch results
-        inst.write(":FETC:ARR:SOUR? (@1)")
-        source = inst.read_ascii_values()
-
-        inst.write(":FETC:ARR:CURR? (@1)")
-        current = inst.read_ascii_values()
-
-        if meas_volt:
-            inst.write(":FETC:ARR:VOLT? (@1)")
-            voltage = inst.read_ascii_values()
-        else:
-            voltage = [float("nan")] * n_total
-
-        inst.write(":FETC:ARR:TIME? (@1)")
-        rel_time = inst.read_ascii_values()
-        utc_time = [start_utc + t for t in rel_time]
-
-        self.ammeter_off()
-        self.output_off()
 
         return {
             "source_v":    list(source),

@@ -209,11 +209,11 @@ class B2987BController:
     # ------------------------------------------------------------------
 
     def configure_sweep(self,
-                        source_range: float = 1000,
-                        n_per_voltage: int = 5,
-                        delay_s: float = 0.1,
-                        measure_voltage: bool = False,
-                        current_limit: bool = False,
+                        source_range: float | None = None,
+                        n_per_voltage: int | None = None,
+                        delay_s: float | None = None,
+                        measure_voltage: bool | None = None,
+                        current_limit: bool | None = None,
                         # Backwards-compat alias for current_aperture (FIXED mode)
                         current_aperture_s: float | None = None,
                         # Current sense
@@ -240,11 +240,15 @@ class B2987BController:
         the current aperture to FIXED at that value, preserving the older
         API where `current_aperture_s=None` meant AUTO/LONG.
         """
-        self._source_range    = source_range
-        self._n_per_voltage   = n_per_voltage
-        self._delay_s         = delay_s
-        self._measure_voltage = measure_voltage
-        self._current_limit   = current_limit
+        # These five used to have real defaults, so any partial call (e.g. a
+        # GUI applying only the aperture) reset the source range to 1000 V and
+        # the current-limit resistor to off, and pushed both to the instrument
+        # even with the output on.
+        if source_range    is not None: self._source_range    = source_range
+        if n_per_voltage   is not None: self._n_per_voltage   = n_per_voltage
+        if delay_s         is not None: self._delay_s         = delay_s
+        if measure_voltage is not None: self._measure_voltage = measure_voltage
+        if current_limit   is not None: self._current_limit   = current_limit
 
         # Current sense — partial updates
         if current_range_auto    is not None: self._current_range_auto    = current_range_auto
@@ -271,8 +275,8 @@ class B2987BController:
 
         if zero_reference        is not None: self._zero_reference        = zero_reference
 
-        self._driver.set_source_range(source_range)
-        self._driver.set_current_limit(current_limit)
+        if source_range  is not None: self._driver.set_source_range(source_range)
+        if current_limit is not None: self._driver.set_current_limit(current_limit)
 
     # ------------------------------------------------------------------
     # Bias-only control (no measurement)
@@ -485,6 +489,134 @@ class B2987BController:
             run_timestamp = run_ts,
         )
         return result
+
+    def request_stop(self):
+        """Stop a running sweep() or ammeter() from another thread."""
+        self._driver.request_stop()
+
+    def _current_sense(self) -> dict:
+        return dict(current_range_auto    = self._current_range_auto,
+                    current_range_v       = self._current_range_v,
+                    current_range_lower_a = self._current_range_lower_a,
+                    current_range_upper_a = self._current_range_upper_a,
+                    current_aperture_mode = self._current_aperture_mode,
+                    current_aperture_s    = self._current_aperture)
+
+    def _reading_s(self) -> float:
+        """Upper estimate of one reading's integration time."""
+        if self._current_aperture_mode == "FIXED" and self._current_aperture:
+            return self._current_aperture
+        return 2.0      # longest auto aperture
+
+    def _series_result(self, source_v, current_a, timestamp_s, n_per_voltage) -> SweepResult:
+        source_v  = np.array(source_v,    dtype=np.float64)
+        current_a = np.array(current_a,   dtype=np.float64)
+        timestamp = np.array(timestamp_s, dtype=np.float64)
+        voltage_v = np.full(len(current_a), np.nan)
+        avg_s, avg_i, avg_v, err_i, err_v = self._stat_analysis(source_v, current_a, voltage_v)
+        return SweepResult(
+            source_v       = source_v,
+            current_a      = current_a,
+            voltage_v      = voltage_v,
+            timestamp_s    = timestamp,
+            avg_source_v   = avg_s,
+            avg_current_a  = avg_i,
+            avg_voltage_v  = avg_v,
+            err_current_a  = err_i,
+            err_voltage_v  = err_v,
+            n_per_voltage  = n_per_voltage,
+            bias_voltage_V = float(source_v[0]) if len(source_v) else 0.0,
+            run_timestamp  = float(timestamp[0]) if len(timestamp) else time.time(),
+        )
+
+    def ammeter(self, n: int, interval_s: float = 0.0,
+                on_chunk: Callable | None = None) -> SweepResult:
+        """
+        Ammeter mode: n current readings at the present source state with the
+        configured current range and aperture. The source is not touched, so
+        this works with the output off (e.g. an unbiased photodiode).
+
+        Readings are taken in ~1 s chunks; on_chunk(currents, timestamps) is
+        called after each so a GUI can plot while it runs. interval_s > 0
+        spaces the readings; 0 takes them back to back. source_v records the
+        set voltage while the output is on, else 0.
+        """
+        d = self._driver
+        d.reset_stop()
+        per = max(self._reading_s(), interval_s, 1e-3)
+        typical = (self._current_aperture if self._current_aperture_mode == "FIXED"
+                   and self._current_aperture else 0.1)
+        chunk = max(1, int(1.0 / max(typical, interval_s, 1e-3)))
+        v_set = d._source_voltage if d._output_on else 0.0
+        current, stamps = [], []
+        d.configure_current_sense(False, **self._current_sense())
+        d.ammeter_on()
+        try:
+            while len(current) < n:
+                k = min(chunk, n - len(current))
+                raw = d.acquire_current(k, interval_s, timeout_s=k * (per + 0.1) + 10.0)
+                current += raw["current_a"]
+                stamps  += raw["timestamp_s"]
+                if on_chunk:
+                    on_chunk(raw["current_a"], raw["timestamp_s"])
+                d.check_stop()
+        finally:
+            d.ammeter_off()
+        return self._series_result([v_set] * len(current), current, stamps, len(current))
+
+    def sweep_live(self, voltages, n_per_voltage: int | None = None,
+                   delay_s: float | None = None, on_point: Callable | None = None,
+                   timeout_s: float = 3600.0) -> SweepResult:
+        """
+        IV sweep stepped one voltage at a time. Readings are fetched in ~1 s
+        chunks and passed to on_point(voltage, currents, timestamps) so a GUI
+        can plot while it runs; sweep() uses the instrument's list sweep, whose
+        data can only be fetched once it has finished.
+
+        Every voltage is checked against the bias lock and the HV interlock
+        before the output is switched on, and the output is off again when
+        this returns, raises or is stopped.
+        """
+        voltages = [float(v) for v in voltages]
+        n     = n_per_voltage if n_per_voltage is not None else self._n_per_voltage
+        delay = delay_s       if delay_s       is not None else self._delay_s
+        d = self._driver
+        d.reset_stop()
+        d._guard_hv(voltages)
+        d.set_source_range(self._source_range)
+        d.set_current_limit(self._current_limit)
+        d.configure_current_sense(self._zero_reference, **self._current_sense())
+        d.set_voltage(voltages[0])
+        deadline = time.monotonic() + timeout_s
+        typical = (self._current_aperture if self._current_aperture_mode == "FIXED"
+                   and self._current_aperture else 0.1) + delay
+        chunk = max(1, int(1.0 / max(typical, 1e-3)))
+        src, current, stamps = [], [], []
+        d.output_on()
+        self._bias_voltage, self._bias_active = voltages[0], True
+        d.ammeter_on()
+        try:
+            time.sleep(0.5)
+            for v in voltages:
+                d.check_stop()
+                d.write_level(v)
+                got = 0
+                while got < n:
+                    k = min(chunk, n - got)
+                    raw = d.acquire_current(k, delay_s=delay,
+                                            timeout_s=max(1.0, deadline - time.monotonic()))
+                    src     += [v] * len(raw["current_a"])
+                    current += raw["current_a"]
+                    stamps  += raw["timestamp_s"]
+                    got     += k
+                    if on_point:
+                        on_point(v, raw["current_a"], raw["timestamp_s"])
+                    d.check_stop()
+        finally:
+            d.ammeter_off()
+            d.output_off()
+            self._bias_active = False
+        return self._series_result(src, current, stamps, n)
 
     # ------------------------------------------------------------------
     # Statistical analysis (carried over from DataAnalysis.py)
